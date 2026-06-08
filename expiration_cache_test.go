@@ -57,7 +57,7 @@ var _ = Describe("Expiration cache", func() {
 
 				// wait for cleanup run
 				Eventually(func() int {
-					return cache.lru.Len()
+					return cache.TotalCount()
 				}).Should(Equal(0))
 			})
 		})
@@ -263,9 +263,9 @@ var _ = Describe("Expiration cache", func() {
 				// key1 was removed
 				Expect(cache.Get("key1")).Should(BeNil())
 				// key2,3,4 still in the cache
-				Expect(cache.lru.Contains("key2")).Should(BeTrue())
-				Expect(cache.lru.Contains("key3")).Should(BeTrue())
-				Expect(cache.lru.Contains("key4")).Should(BeTrue())
+				Expect(cache.shard("key2").Contains("key2")).Should(BeTrue())
+				Expect(cache.shard("key3").Contains("key3")).Should(BeTrue())
+				Expect(cache.shard("key4").Contains("key4")).Should(BeTrue())
 
 				// now get key2 to increase usage count
 				_, _ = cache.Get("key2")
@@ -274,10 +274,10 @@ var _ = Describe("Expiration cache", func() {
 				cache.Put("key5", &v5, time.Second)
 
 				// now key3 should be removed
-				Expect(cache.lru.Contains("key2")).Should(BeTrue())
-				Expect(cache.lru.Contains("key3")).Should(BeFalse())
-				Expect(cache.lru.Contains("key4")).Should(BeTrue())
-				Expect(cache.lru.Contains("key5")).Should(BeTrue())
+				Expect(cache.shard("key2").Contains("key2")).Should(BeTrue())
+				Expect(cache.shard("key3").Contains("key3")).Should(BeFalse())
+				Expect(cache.shard("key4").Contains("key4")).Should(BeTrue())
+				Expect(cache.shard("key5").Contains("key5")).Should(BeTrue())
 			})
 		})
 	})

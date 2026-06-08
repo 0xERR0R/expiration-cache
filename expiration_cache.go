@@ -2,6 +2,7 @@ package expirationcache
 
 import (
 	"context"
+	"hash/maphash"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
@@ -25,7 +26,9 @@ type ExpirationLRUCache[T any] struct {
 	onCacheHit      OnCacheHitCallback
 	onCacheMiss     OnCacheMissCallback
 	onAfterPut      OnAfterPutCallback
-	lru             *lru.Cache
+	shards          []*lru.Cache
+	seed            maphash.Seed
+	mask            uint64
 }
 
 // Options configures the behavior of ExpirationLRUCache.
@@ -41,6 +44,11 @@ type Options struct {
 	OnAfterPutFn    OnAfterPutCallback
 	CleanupInterval time.Duration
 	MaxSize         uint
+	// Shards sets the number of independent LRU shards the cache is split into,
+	// rounded up to a power of two. Keys are routed to a shard by hash, so reads
+	// on different shards never contend on the same lock. 0 means a single shard
+	// (no sharding) and matches pre-sharding behavior. This is the default.
+	Shards uint
 }
 
 // OnExpirationCallback will be called just before an element gets expired and will
@@ -75,7 +83,24 @@ func NewCache[T any](ctx context.Context, options Options) *ExpirationLRUCache[T
 func NewCacheWithOnExpired[T any](ctx context.Context, options Options,
 	onExpirationFn OnExpirationCallback[T],
 ) *ExpirationLRUCache[T] {
-	l, _ := lru.New(defaultSize)
+	size := defaultSize
+	if options.MaxSize > 0 {
+		size = int(options.MaxSize)
+	}
+
+	shardCount := nextPow2(options.Shards)
+
+	perShard := (size + shardCount - 1) / shardCount
+	if perShard < 1 {
+		perShard = 1
+	}
+
+	shards := make([]*lru.Cache, shardCount)
+	for i := range shards {
+		l, _ := lru.New(perShard)
+		shards[i] = l
+	}
+
 	c := &ExpirationLRUCache[T]{
 		cleanUpInterval: defaultCleanUpInterval,
 		preExpirationFn: func(ctx context.Context, key string) (val *T, ttl time.Duration) {
@@ -83,16 +108,13 @@ func NewCacheWithOnExpired[T any](ctx context.Context, options Options,
 		},
 		onCacheHit:  func(key string) {},
 		onCacheMiss: func(key string) {},
-		lru:         l,
+		shards:      shards,
+		seed:        maphash.MakeSeed(),
+		mask:        uint64(shardCount - 1),
 	}
 
 	if options.CleanupInterval > 0 {
 		c.cleanUpInterval = options.CleanupInterval
-	}
-
-	if options.MaxSize > 0 {
-		l, _ := lru.New(int(options.MaxSize))
-		c.lru = l
 	}
 
 	if options.OnAfterPutFn != nil {
@@ -116,6 +138,34 @@ func NewCacheWithOnExpired[T any](ctx context.Context, options Options,
 	return c
 }
 
+// nextPow2 returns the smallest power of two >= n, and at least 1.
+func nextPow2(n uint) int {
+	if n <= 1 {
+		return 1
+	}
+
+	p := 1
+	for uint(p) < n {
+		p <<= 1
+	}
+
+	return p
+}
+
+// shard returns the LRU shard that owns key.
+func (e *ExpirationLRUCache[T]) shard(key string) *lru.Cache {
+	return e.shards[maphash.String(e.seed, key)&e.mask]
+}
+
+// totalCount sums the live element count across all shards.
+func (e *ExpirationLRUCache[T]) totalCount() (count int) {
+	for _, shard := range e.shards {
+		count += shard.Len()
+	}
+
+	return count
+}
+
 func periodicCleanup[T any](ctx context.Context, c *ExpirationLRUCache[T]) {
 	ticker := time.NewTicker(c.cleanUpInterval)
 	defer ticker.Stop()
@@ -133,11 +183,13 @@ func periodicCleanup[T any](ctx context.Context, c *ExpirationLRUCache[T]) {
 func (e *ExpirationLRUCache[T]) cleanUp() {
 	var expiredKeys []string
 
-	// check for expired items and collect expired keys
-	for _, k := range e.lru.Keys() {
-		if v, ok := e.lru.Peek(k); ok {
-			if isExpired(v.(*element[T])) {
-				expiredKeys = append(expiredKeys, k.(string))
+	// check every shard for expired items and collect expired keys
+	for _, shard := range e.shards {
+		for _, k := range shard.Keys() {
+			if v, ok := shard.Peek(k); ok {
+				if isExpired(v.(*element[T])) {
+					expiredKeys = append(expiredKeys, k.(string))
+				}
 			}
 		}
 	}
@@ -155,7 +207,7 @@ func (e *ExpirationLRUCache[T]) cleanUp() {
 		}
 
 		for _, key := range keysToDelete {
-			e.lru.Remove(key)
+			e.shard(key).Remove(key)
 		}
 	}
 }
@@ -175,13 +227,13 @@ func (e *ExpirationLRUCache[T]) Put(key string, val *T, ttl time.Duration) {
 	expiresEpochMs := time.Now().UnixMilli() + ttl.Milliseconds()
 
 	// add new item
-	e.lru.Add(key, &element[T]{
+	e.shard(key).Add(key, &element[T]{
 		val:            val,
 		expiresEpochMs: expiresEpochMs,
 	})
 
 	if e.onAfterPut != nil {
-		e.onAfterPut(e.lru.Len())
+		e.onAfterPut(e.totalCount())
 	}
 }
 
@@ -190,7 +242,7 @@ func (e *ExpirationLRUCache[T]) Put(key string, val *T, ttl time.Duration) {
 //
 // key: The cache key.
 func (e *ExpirationLRUCache[T]) Get(key string) (val *T, ttl time.Duration) {
-	el, found := e.lru.Get(key)
+	el, found := e.shard(key).Get(key)
 
 	if found {
 		e.onCacheHit(key)
@@ -217,10 +269,12 @@ func calculateRemainTTL(expiresEpoch int64) time.Duration {
 
 // TotalCount returns the current number of items in the cache.
 func (e *ExpirationLRUCache[T]) TotalCount() (count int) {
-	return e.lru.Len()
+	return e.totalCount()
 }
 
 // Clear removes all items from the cache.
 func (e *ExpirationLRUCache[T]) Clear() {
-	e.lru.Purge()
+	for _, shard := range e.shards {
+		shard.Purge()
+	}
 }
