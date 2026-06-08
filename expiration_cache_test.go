@@ -3,6 +3,9 @@ package expirationcache
 import (
 	"context"
 	"fmt"
+	"math"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +21,156 @@ var _ = Describe("Expiration cache", func() {
 	BeforeEach(func() {
 		ctx, cancelFn = context.WithCancel(context.Background())
 		DeferCleanup(cancelFn)
+	})
+	Describe("Sharding", func() {
+		It("rounds the shard count up to a power of two", func() {
+			cache := NewCache[string](ctx, Options{Shards: 5})
+			Expect(cache.shards).Should(HaveLen(8))
+		})
+
+		It("defaults to a single shard", func() {
+			cache := NewCache[string](ctx, Options{})
+			Expect(cache.shards).Should(HaveLen(1))
+		})
+
+		It("routes a key to the same shard every time", func() {
+			cache := NewCache[string](ctx, Options{Shards: 8})
+			Expect(cache.shard("some-key")).Should(BeIdenticalTo(cache.shard("some-key")))
+		})
+
+		It("spreads keys across more than one shard", func() {
+			cache := NewCache[int](ctx, Options{Shards: 16, MaxSize: 10000})
+			for i := range 1000 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			used := 0
+			for _, s := range cache.shards {
+				if s.Len() > 0 {
+					used++
+				}
+			}
+
+			// 1000 keys across 16 shards reach every shard with overwhelming probability
+			Expect(used).Should(Equal(len(cache.shards)))
+			Expect(cache.TotalCount()).Should(Equal(1000))
+		})
+
+		It("clamps an absurd shard count instead of hanging or panicking", func() {
+			// a huge Shards value must not overflow the power-of-two rounding loop
+			cache := NewCache[int](ctx, Options{Shards: math.MaxUint, MaxSize: 1000})
+			Expect(len(cache.shards)).Should(And(
+				BeNumerically(">", 0),
+				BeNumerically("<=", 1000)))
+
+			v := 1
+			cache.Put("k", &v, time.Minute)
+			got, _ := cache.Get("k")
+			Expect(got).Should(HaveValue(Equal(1)))
+		})
+
+		It("does not collapse capacity when MaxSize overflows int", func() {
+			// MaxSize > MaxInt must clamp to a large positive size, not a negative one
+			cache := NewCache[int](ctx, Options{MaxSize: math.MaxUint})
+			for i := range 1000 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			Expect(cache.TotalCount()).Should(Equal(1000))
+		})
+
+		It("never creates more shards than the capacity allows", func() {
+			// 16 shards over a 4-item cache would leave shards with zero capacity
+			cache := NewCache[int](ctx, Options{Shards: 16, MaxSize: 4})
+			Expect(len(cache.shards)).Should(BeNumerically("<=", 4))
+
+			for i := range 100 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			Expect(cache.TotalCount()).Should(BeNumerically("<=", 4))
+		})
+
+		It("keeps total entries within the global cap across shards", func() {
+			// 8 does not divide 100, so capacity is distributed as 4 shards of 13 and
+			// 4 of 12 (= 100). The total must never exceed MaxSize despite the rounding.
+			cache := NewCache[int](ctx, Options{Shards: 8, MaxSize: 100})
+			for i := range 1000 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			Expect(cache.TotalCount()).Should(BeNumerically("<=", 100))
+		})
+
+		It("revives expired entries across shards via preExpirationFn", func() {
+			var reloaded atomic.Int32
+			reload := func(_ context.Context, _ string) (*string, time.Duration) {
+				reloaded.Add(1)
+				v := "reloaded"
+
+				return &v, time.Minute
+			}
+
+			cache := NewCacheWithOnExpired[string](ctx,
+				Options{Shards: 8, CleanupInterval: 50 * time.Millisecond}, reload)
+			for i := range 20 {
+				v := "v"
+				cache.Put(fmt.Sprintf("key%d", i), &v, 20*time.Millisecond)
+			}
+
+			Eventually(func() int32 {
+				return reloaded.Load()
+			}, "1s").Should(Equal(int32(20)))
+
+			// the entries must actually be revived in their shards, not just the
+			// callback fired: every key should now hold the reloaded value
+			for i := range 20 {
+				val, ttl := cache.Get(fmt.Sprintf("key%d", i))
+				Expect(val).Should(HaveValue(Equal("reloaded")))
+				Expect(ttl).Should(BeNumerically(">", time.Duration(0)))
+			}
+			Expect(cache.TotalCount()).Should(Equal(20))
+		})
+
+		It("never reports a negative count under concurrent puts, evictions and cleanup", func() {
+			// A small capacity forces constant eviction while a tight cleanup
+			// interval reconciles the counter concurrently. If the eviction
+			// decrement were a plain Add(-1), a reconcile snapshot landing between a
+			// Put's increment and its matching eviction could drive count below zero.
+			cache := NewCache[int](ctx, Options{
+				Shards:          8,
+				MaxSize:         64,
+				CleanupInterval: time.Millisecond,
+			})
+
+			var wg sync.WaitGroup
+			var negatives atomic.Int32
+
+			for g := range 8 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := range 5000 {
+						v := i
+						cache.Put(fmt.Sprintf("g%d-key%d", g, i), &v, time.Minute)
+						if cache.TotalCount() < 0 {
+							negatives.Add(1)
+						}
+					}
+				}()
+			}
+
+			wg.Wait()
+
+			Expect(negatives.Load()).Should(BeZero())
+			Expect(cache.TotalCount()).Should(And(
+				BeNumerically(">=", 0),
+				BeNumerically("<=", 64)))
+		})
 	})
 	Describe("Basic operations", func() {
 		When("string cache was created", func() {
@@ -57,7 +210,7 @@ var _ = Describe("Expiration cache", func() {
 
 				// wait for cleanup run
 				Eventually(func() int {
-					return cache.lru.Len()
+					return cache.TotalCount()
 				}).Should(Equal(0))
 			})
 		})
@@ -263,9 +416,9 @@ var _ = Describe("Expiration cache", func() {
 				// key1 was removed
 				Expect(cache.Get("key1")).Should(BeNil())
 				// key2,3,4 still in the cache
-				Expect(cache.lru.Contains("key2")).Should(BeTrue())
-				Expect(cache.lru.Contains("key3")).Should(BeTrue())
-				Expect(cache.lru.Contains("key4")).Should(BeTrue())
+				Expect(cache.shard("key2").Contains("key2")).Should(BeTrue())
+				Expect(cache.shard("key3").Contains("key3")).Should(BeTrue())
+				Expect(cache.shard("key4").Contains("key4")).Should(BeTrue())
 
 				// now get key2 to increase usage count
 				_, _ = cache.Get("key2")
@@ -274,10 +427,10 @@ var _ = Describe("Expiration cache", func() {
 				cache.Put("key5", &v5, time.Second)
 
 				// now key3 should be removed
-				Expect(cache.lru.Contains("key2")).Should(BeTrue())
-				Expect(cache.lru.Contains("key3")).Should(BeFalse())
-				Expect(cache.lru.Contains("key4")).Should(BeTrue())
-				Expect(cache.lru.Contains("key5")).Should(BeTrue())
+				Expect(cache.shard("key2").Contains("key2")).Should(BeTrue())
+				Expect(cache.shard("key3").Contains("key3")).Should(BeFalse())
+				Expect(cache.shard("key4").Contains("key4")).Should(BeTrue())
+				Expect(cache.shard("key5").Contains("key5")).Should(BeTrue())
 			})
 		})
 	})
