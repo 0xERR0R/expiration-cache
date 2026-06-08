@@ -3,6 +3,7 @@ package expirationcache
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,72 @@ var _ = Describe("Expiration cache", func() {
 	BeforeEach(func() {
 		ctx, cancelFn = context.WithCancel(context.Background())
 		DeferCleanup(cancelFn)
+	})
+	Describe("Sharding", func() {
+		It("rounds the shard count up to a power of two", func() {
+			cache := NewCache[string](ctx, Options{Shards: 5})
+			Expect(cache.shards).Should(HaveLen(8))
+		})
+
+		It("defaults to a single shard", func() {
+			cache := NewCache[string](ctx, Options{})
+			Expect(cache.shards).Should(HaveLen(1))
+		})
+
+		It("routes a key to the same shard every time", func() {
+			cache := NewCache[string](ctx, Options{Shards: 8})
+			Expect(cache.shard("some-key")).Should(BeIdenticalTo(cache.shard("some-key")))
+		})
+
+		It("spreads keys across more than one shard", func() {
+			cache := NewCache[int](ctx, Options{Shards: 16, MaxSize: 10000})
+			for i := range 1000 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			used := 0
+			for _, s := range cache.shards {
+				if s.Len() > 0 {
+					used++
+				}
+			}
+
+			Expect(used).Should(BeNumerically(">", 1))
+			Expect(cache.TotalCount()).Should(Equal(1000))
+		})
+
+		It("keeps total entries within the global cap across shards", func() {
+			// per-shard cap = ceil(100/4) = 25; global cap = 25*4 = 100
+			cache := NewCache[int](ctx, Options{Shards: 4, MaxSize: 100})
+			for i := range 1000 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			Expect(cache.TotalCount()).Should(BeNumerically("<=", 100))
+		})
+
+		It("revives expired entries across shards via preExpirationFn", func() {
+			var reloaded atomic.Int32
+			reload := func(_ context.Context, _ string) (*string, time.Duration) {
+				reloaded.Add(1)
+				v := "reloaded"
+
+				return &v, time.Minute
+			}
+
+			cache := NewCacheWithOnExpired[string](ctx,
+				Options{Shards: 8, CleanupInterval: 50 * time.Millisecond}, reload)
+			for i := range 20 {
+				v := "v"
+				cache.Put(fmt.Sprintf("key%d", i), &v, 20*time.Millisecond)
+			}
+
+			Eventually(func() int32 {
+				return reloaded.Load()
+			}, "1s").Should(Equal(int32(20)))
+		})
 	})
 	Describe("Basic operations", func() {
 		When("string cache was created", func() {
