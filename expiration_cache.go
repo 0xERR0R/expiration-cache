@@ -140,8 +140,22 @@ func NewCacheWithOnExpired[T any](ctx context.Context, options Options,
 	base := size / shardCount
 	remainder := size % shardCount
 
+	// Saturating decrement: the count is also reconciled by cleanUp via
+	// count.Store(liveCount()). If such a Store snapshots the counter between a
+	// Put's increment and the matching eviction here, a plain Add(-1) could cross
+	// below zero. Flooring at zero keeps count >= 0 an invariant; the rare dropped
+	// decrement self-corrects at the next reconcile.
 	onEvict := func(_ string, _ *element[T]) {
-		c.count.Add(-1)
+		for {
+			v := c.count.Load()
+			if v <= 0 {
+				return
+			}
+
+			if c.count.CompareAndSwap(v, v-1) {
+				return
+			}
+		}
 	}
 
 	shards := make([]*lru.Cache[string, *element[T]], shardCount)

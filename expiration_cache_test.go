@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -133,6 +134,42 @@ var _ = Describe("Expiration cache", func() {
 				Expect(ttl).Should(BeNumerically(">", time.Duration(0)))
 			}
 			Expect(cache.TotalCount()).Should(Equal(20))
+		})
+
+		It("never reports a negative count under concurrent puts, evictions and cleanup", func() {
+			// A small capacity forces constant eviction while a tight cleanup
+			// interval reconciles the counter concurrently. If the eviction
+			// decrement were a plain Add(-1), a reconcile snapshot landing between a
+			// Put's increment and its matching eviction could drive count below zero.
+			cache := NewCache[int](ctx, Options{
+				Shards:          8,
+				MaxSize:         64,
+				CleanupInterval: time.Millisecond,
+			})
+
+			var wg sync.WaitGroup
+			var negatives atomic.Int32
+
+			for g := range 8 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := range 5000 {
+						v := i
+						cache.Put(fmt.Sprintf("g%d-key%d", g, i), &v, time.Minute)
+						if cache.TotalCount() < 0 {
+							negatives.Add(1)
+						}
+					}
+				}()
+			}
+
+			wg.Wait()
+
+			Expect(negatives.Load()).Should(BeZero())
+			Expect(cache.TotalCount()).Should(And(
+				BeNumerically(">=", 0),
+				BeNumerically("<=", 64)))
 		})
 	})
 	Describe("Basic operations", func() {
