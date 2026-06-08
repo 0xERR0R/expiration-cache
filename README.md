@@ -35,6 +35,7 @@ func main() {
     if val != nil {
         println(*val, ttl.String())
     }
+    cache.Remove("key1") // delete a single entry (no-op if absent)
 }
 ```
 

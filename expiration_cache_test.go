@@ -254,6 +254,54 @@ var _ = Describe("Expiration cache", func() {
 				Expect(cache.TotalCount()).Should(Equal(0))
 			})
 		})
+		When("Removing a single key", func() {
+			It("should delete the entry and decrement the count", func() {
+				cache := NewCache[string](ctx, Options{})
+				v1 := "v1"
+				v2 := "v2"
+				cache.Put("key1", &v1, time.Second)
+				cache.Put("key2", &v2, time.Second)
+
+				Expect(cache.TotalCount()).Should(Equal(2))
+
+				cache.Remove("key1")
+
+				val, _ := cache.Get("key1")
+				Expect(val).Should(BeNil())
+				// the other key is untouched
+				val2, _ := cache.Get("key2")
+				Expect(val2).Should(HaveValue(Equal("v2")))
+				Expect(cache.TotalCount()).Should(Equal(1))
+			})
+			It("should be a no-op for a missing key", func() {
+				cache := NewCache[string](ctx, Options{})
+				v1 := "v1"
+				cache.Put("key1", &v1, time.Second)
+
+				cache.Remove("does-not-exist")
+
+				val, _ := cache.Get("key1")
+				Expect(val).Should(HaveValue(Equal("v1")))
+				Expect(cache.TotalCount()).Should(Equal(1))
+			})
+			It("removes keys routed to different shards", func() {
+				cache := NewCache[int](ctx, Options{Shards: 8, MaxSize: 1000})
+				for i := range 100 {
+					v := i
+					cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+				}
+
+				Expect(cache.TotalCount()).Should(Equal(100))
+
+				for i := range 100 {
+					cache.Remove(fmt.Sprintf("key%d", i))
+				}
+
+				Expect(cache.TotalCount()).Should(Equal(0))
+				val, _ := cache.Get("key42")
+				Expect(val).Should(BeNil())
+			})
+		})
 		When("Adding value with negative TTL", func() {
 			It("should not store value with negative TTL", func() {
 				v := "neg"
