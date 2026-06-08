@@ -5,7 +5,7 @@ import (
 	"hash/maphash"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 const (
@@ -26,7 +26,7 @@ type ExpirationLRUCache[T any] struct {
 	onCacheHit      OnCacheHitCallback
 	onCacheMiss     OnCacheMissCallback
 	onAfterPut      OnAfterPutCallback
-	shards          []*lru.Cache
+	shards          []*lru.Cache[string, *element[T]]
 	seed            maphash.Seed
 	mask            uint64
 }
@@ -95,9 +95,9 @@ func NewCacheWithOnExpired[T any](ctx context.Context, options Options,
 		perShard = 1
 	}
 
-	shards := make([]*lru.Cache, shardCount)
+	shards := make([]*lru.Cache[string, *element[T]], shardCount)
 	for i := range shards {
-		l, _ := lru.New(perShard)
+		l, _ := lru.New[string, *element[T]](perShard)
 		shards[i] = l
 	}
 
@@ -153,7 +153,7 @@ func nextPow2(n uint) int {
 }
 
 // shard returns the LRU shard that owns key.
-func (e *ExpirationLRUCache[T]) shard(key string) *lru.Cache {
+func (e *ExpirationLRUCache[T]) shard(key string) *lru.Cache[string, *element[T]] {
 	return e.shards[maphash.String(e.seed, key)&e.mask]
 }
 
@@ -187,8 +187,8 @@ func (e *ExpirationLRUCache[T]) cleanUp() {
 	for _, shard := range e.shards {
 		for _, k := range shard.Keys() {
 			if v, ok := shard.Peek(k); ok {
-				if isExpired(v.(*element[T])) {
-					expiredKeys = append(expiredKeys, k.(string))
+				if isExpired(v) {
+					expiredKeys = append(expiredKeys, k)
 				}
 			}
 		}
@@ -247,7 +247,7 @@ func (e *ExpirationLRUCache[T]) Get(key string) (val *T, ttl time.Duration) {
 	if found {
 		e.onCacheHit(key)
 
-		return el.(*element[T]).val, calculateRemainTTL(el.(*element[T]).expiresEpochMs)
+		return el.val, calculateRemainTTL(el.expiresEpochMs)
 	}
 
 	e.onCacheMiss(key)
