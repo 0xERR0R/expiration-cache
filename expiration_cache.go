@@ -130,6 +130,7 @@ func NewCacheWithOnExpired[T any](ctx context.Context, options Options,
 		},
 		onCacheHit:  func(key string) {},
 		onCacheMiss: func(key string) {},
+		onAfterPut:  func(newSize int) {},
 		seed:        maphash.MakeSeed(),
 		mask:        uint64(shardCount - 1),
 	}
@@ -336,9 +337,7 @@ func (e *ExpirationLRUCache[T]) Put(key string, val *T, ttl time.Duration) {
 		expiresEpochMs: expiresEpochMs,
 	})
 
-	if e.onAfterPut != nil {
-		e.onAfterPut(int(e.count.Load()))
-	}
+	e.onAfterPut(int(e.count.Load()))
 }
 
 // Get retrieves a value from the cache by key. Can return already expired value.
@@ -369,6 +368,15 @@ func calculateRemainTTL(expiresEpoch int64) time.Duration {
 	}
 
 	return 0
+}
+
+// Remove deletes the entry with the given key from the cache. Removing a key
+// that is not present is a no-op. The live counter is kept in sync by the LRU's
+// eviction callback, so TotalCount reflects the removal.
+//
+// key: The cache key to remove.
+func (e *ExpirationLRUCache[T]) Remove(key string) {
+	e.shard(key).Remove(key)
 }
 
 // TotalCount returns the current number of items in the cache.
