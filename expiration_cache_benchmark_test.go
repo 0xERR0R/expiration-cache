@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +37,9 @@ func BenchmarkGetParallel(b *testing.B) {
 			defer cancel()
 
 			cache := expirationcache.NewCache[int](ctx, expirationcache.Options{
-				MaxSize:         numKeys,
+				// give every shard enough slack that uneven hashing never evicts
+				// during warm-up, so all shard counts measure a 100% hit ratio
+				MaxSize:         numKeys * 2,
 				CleanupInterval: time.Hour, // keep the janitor out of the measurement
 				Shards:          shards,
 			})
@@ -46,11 +49,19 @@ func BenchmarkGetParallel(b *testing.B) {
 				cache.Put(keys[i], &v, time.Hour)
 			}
 
+			if got := cache.TotalCount(); got != numKeys {
+				b.Fatalf("warm-up evicted entries: have %d of %d keys; raise MaxSize", got, numKeys)
+			}
+
 			b.ReportAllocs()
 			b.ResetTimer()
 
+			var next atomic.Uint64
+
 			b.RunParallel(func(pb *testing.PB) {
-				i := 0
+				// start each goroutine at a distinct key so they spread across shards
+				// instead of contending on the same shard in lockstep
+				i := int(next.Add(1)) * 97
 				for pb.Next() {
 					cache.Get(keys[i%numKeys])
 					i++

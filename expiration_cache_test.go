@@ -3,6 +3,7 @@ package expirationcache
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,13 +51,52 @@ var _ = Describe("Expiration cache", func() {
 				}
 			}
 
-			Expect(used).Should(BeNumerically(">", 1))
+			// 1000 keys across 16 shards reach every shard with overwhelming probability
+			Expect(used).Should(Equal(len(cache.shards)))
 			Expect(cache.TotalCount()).Should(Equal(1000))
 		})
 
+		It("clamps an absurd shard count instead of hanging or panicking", func() {
+			// a huge Shards value must not overflow the power-of-two rounding loop
+			cache := NewCache[int](ctx, Options{Shards: math.MaxUint, MaxSize: 1000})
+			Expect(len(cache.shards)).Should(And(
+				BeNumerically(">", 0),
+				BeNumerically("<=", 1000)))
+
+			v := 1
+			cache.Put("k", &v, time.Minute)
+			got, _ := cache.Get("k")
+			Expect(got).Should(HaveValue(Equal(1)))
+		})
+
+		It("does not collapse capacity when MaxSize overflows int", func() {
+			// MaxSize > MaxInt must clamp to a large positive size, not a negative one
+			cache := NewCache[int](ctx, Options{MaxSize: math.MaxUint})
+			for i := range 1000 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			Expect(cache.TotalCount()).Should(Equal(1000))
+		})
+
+		It("never creates more shards than the capacity allows", func() {
+			// 16 shards over a 4-item cache would leave shards with zero capacity
+			cache := NewCache[int](ctx, Options{Shards: 16, MaxSize: 4})
+			Expect(len(cache.shards)).Should(BeNumerically("<=", 4))
+
+			for i := range 100 {
+				v := i
+				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
+			}
+
+			Expect(cache.TotalCount()).Should(BeNumerically("<=", 4))
+		})
+
 		It("keeps total entries within the global cap across shards", func() {
-			// per-shard cap = ceil(100/4) = 25; global cap = 25*4 = 100
-			cache := NewCache[int](ctx, Options{Shards: 4, MaxSize: 100})
+			// 8 does not divide 100, so capacity is distributed as 4 shards of 13 and
+			// 4 of 12 (= 100). The total must never exceed MaxSize despite the rounding.
+			cache := NewCache[int](ctx, Options{Shards: 8, MaxSize: 100})
 			for i := range 1000 {
 				v := i
 				cache.Put(fmt.Sprintf("key%d", i), &v, time.Minute)
@@ -84,6 +124,15 @@ var _ = Describe("Expiration cache", func() {
 			Eventually(func() int32 {
 				return reloaded.Load()
 			}, "1s").Should(Equal(int32(20)))
+
+			// the entries must actually be revived in their shards, not just the
+			// callback fired: every key should now hold the reloaded value
+			for i := range 20 {
+				val, ttl := cache.Get(fmt.Sprintf("key%d", i))
+				Expect(val).Should(HaveValue(Equal("reloaded")))
+				Expect(ttl).Should(BeNumerically(">", time.Duration(0)))
+			}
+			Expect(cache.TotalCount()).Should(Equal(20))
 		})
 	})
 	Describe("Basic operations", func() {
