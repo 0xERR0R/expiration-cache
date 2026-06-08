@@ -76,16 +76,21 @@ cache.Put("k", &v, time.Second)
 Every `Get` takes the LRU's lock to update recency, so on multi-core systems all reads
 serialize on a single mutex. Set `Shards` to split the cache into N independent LRUs
 (rounded up to a power of two); keys are routed to a shard by hash, so reads on
-different shards never contend. `Shards: 0` (the default) means a single shard —
+different shards never contend. `Shards: 0` or `1` (the default) means a single shard —
 byte-for-byte identical to the unsharded cache.
 
 ```go
 cache := expirationcache.NewCache[string](context.Background(), expirationcache.Options{
     MaxSize: 100_000,
-    Shards:  16, // ~one or two shards per core is a good starting point
+    Shards:  16, // around GOMAXPROCS is a good starting point
 })
 ```
 
-`MaxSize` is divided across shards (each holds `ceil(MaxSize/Shards)` items), so eviction
-is per-shard rather than globally LRU — a standard sharded-cache trade-off that loosens
-as the shard count grows.
+`MaxSize` is distributed across the shards so the **total** never exceeds it, but eviction
+is per-shard rather than globally LRU: a hot shard can evict entries while others still
+have room, so the effective capacity is approximate — a standard sharded-cache trade-off
+that loosens as the shard count grows.
+
+Sharding only helps when multiple goroutines run in parallel on multiple CPUs. On a single
+CPU (`GOMAXPROCS=1`) there is nothing to parallelize and it slightly degrades eviction
+quality, so leave `Shards` at the default unless you actually have contention to relieve.
